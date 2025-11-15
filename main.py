@@ -12,19 +12,16 @@ from telegram.ext import (
 from googlesearch import search
 import requests
 from datetime import datetime, timezone
+import threading
 
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 
-# Telegram bot instance
 bot = Bot(token=TELEGRAM_TOKEN)
-
-# Flask app
 app = Flask(__name__)
 
-# Telegram Application (V20)
 application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
 
@@ -33,8 +30,6 @@ def get_grok_answer(question):
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENROUTER_KEY}",
-        "HTTP-Referer": "https://t.me/PastGlobeBot",
-        "X-Title": "PastGlobeBot",
         "Content-Type": "application/json"
     }
     data = {
@@ -48,7 +43,7 @@ def get_grok_answer(question):
         r = requests.post(url, json=data, headers=headers, timeout=30)
         return r.json()['choices'][0]['message']['content']
     except:
-        return "Server error. Try again."
+        return "❌ Error: API response issue."
 
 
 # ===== WEB SEARCH =====
@@ -60,37 +55,29 @@ def web_search(query):
         return ""
 
 
-# ===== COMMAND HANDLER =====
+# ===== HANDLERS =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("नमस्ते! मैं PastGlobeBot हूँ — पूछिए कुछ भी!")
+    await update.message.reply_text("नमस्ते! PastGlobeBot आपका स्वागत करता है!")
 
 
-# ===== MESSAGE HANDLER =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_msg = update.message.text
+    text = update.message.text
 
-    answer = get_grok_answer(user_msg)
-    search_results = web_search(user_msg)
+    answer = get_grok_answer(text)
+    results = web_search(text + " latest")
 
-    if search_results:
-        answer += "\n\n" + search_results
+    if results:
+        answer += "\n\n" + results
 
     await update.message.reply_text(answer)
 
 
-# Register handlers
+# Add handlers
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 
-# ===== FLASK ROUTES =====
-
-@app.route("/", methods=["GET"])
-def home():
-    return {"status": "PastGlobeBot", "time": datetime.now(timezone.utc).isoformat()}
-
-
-# Webhook route
+# ===== WEBHOOK ROUTE =====
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     json_data = request.get_json(force=True)
@@ -99,14 +86,30 @@ def webhook():
     return "OK", 200
 
 
-# Set webhook when app starts
-@app.before_first_request
-def set_webhook():
+# ===== HOME ROUTE =====
+@app.route("/", methods=["GET"])
+def home():
+    return {
+        "status": "PastGlobeBot live",
+        "server_time": datetime.now(timezone.utc).isoformat()
+    }
+
+
+# ===== SET WEBHOOK (Thread) =====
+def set_webhook_async():
     webhook_url = f"https://pastglobebot.onrender.com/webhook/{TELEGRAM_TOKEN}"
-    bot.delete_webhook()
-    bot.set_webhook(url=webhook_url)
+    try:
+        bot.delete_webhook()
+        bot.set_webhook(url=webhook_url)
+        print("Webhook set:", webhook_url)
+    except Exception as e:
+        print("Webhook error:", e)
 
 
-# Run Flask
+# Set webhook on startup
+threading.Thread(target=set_webhook_async).start()
+
+
+# ===== RUN FLASK =====
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
