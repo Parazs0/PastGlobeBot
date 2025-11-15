@@ -1,43 +1,53 @@
+# main.py
 import os
 import threading
-from flask import Flask, request
-from dotenv import load_dotenv
-from telegram import Update, Bot
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters
-)
-from googlesearch import search
-import requests
+import asyncio
 from datetime import datetime, timezone
+from flask import Flask, jsonify
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import requests
+from googlesearch import search
+from dotenv import load_dotenv
 
-# ----------------------
-# LOAD ENV
-# ----------------------
+# Load env (Render पर भी ठीक)
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 
-bot = Bot(token=TELEGRAM_TOKEN)
 app = Flask(__name__)
 
-# Telegram dispatcher
-application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+# -------------------------
+#        FLASK ROUTES
+# -------------------------
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "PastGlobeBot",
+        "time": datetime.now(timezone.utc).isoformat()
+    })
+
+@app.route("/health")
+def health():
+    return "OK"
 
 
-# ----------------------
-# OPENROUTER ANSWER
-# ----------------------
-def get_openrouter_answer(question):
+# -------------------------
+#      GROK ANSWER API
+# -------------------------
+def get_grok_answer(question):
+    """Blocking: runs inside async executor"""
+    
+    # 📌 Auto-detected today's date for daily updated info
+    today = datetime.now().strftime("%d %B %Y")
+
     url = "https://openrouter.ai/api/v1/chat/completions"
-
     headers = {
         "Authorization": f"Bearer {OPENROUTER_KEY}",
-        "Content-Type": "application/json",
+        "Referer": "https://t.me/PastGlobeBot",
+        "X-Title": "PastGlobeBot",
+        "Content-Type": "application/json"
     }
 
     data = {
@@ -45,97 +55,96 @@ def get_openrouter_answer(question):
         "messages": [
             {
                 "role": "user",
-                "content": question + " (संक्षिप्त हिंदी में जवाब दो)"
+                "content": (
+                    f"{question} "
+                    f"(संक्षिप्त हिंदी में, {today} तक की ताज़ा जानकारी)"
+                )
             }
-        ],
+        ]
     }
 
     try:
-        r = requests.post(url, json=data, headers=headers, timeout=20)
-        return r.json()["choices"][0]["message"]["content"]
+        r = requests.post(url, json=data, headers=headers, timeout=60)
+        if r.status_code != 200:
+            return f"API Error {r.status_code}"
+
+        j = r.json()
+        return j.get("choices", [{}])[0].get("message", {}).get("content", "No content")
+
     except Exception as e:
-        return f"❌ OpenRouter Error: {e}"
+        return f"Error: {str(e)}"
 
 
-# ----------------------
-# GOOGLE SEARCH
-# ----------------------
+# -------------------------
+#         WEB SEARCH
+# -------------------------
 def web_search(query):
+    """Blocking: runs inside async executor"""
     try:
-        results = list(search(query, num_results=2))
-        if not results:
-            return ""
-        return "🔍 वेब खोज:\n" + "\n".join([f"• {r}" for r in results])
+        results = list(search(query, num_results=2, lang="hi"))
+        if results:
+            return "लेटेस्ट वेब रिज़ल्ट्स:\n" + "\n".join(f"• {r}" for r in results)
+        return ""
     except:
         return ""
 
 
-# ----------------------
-# TELEGRAM HANDLERS
-# ----------------------
+# -------------------------
+#       TELEGRAM BOT
+# -------------------------
+application = None
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("नमस्ते! PastGlobeBot आपकी मदद के लिए तैयार है।")
+    await update.message.reply_text("नमस्ते! मैं आपको ताज़ा अपडेट के साथ मदद करूँगा।")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    user_msg = update.message.text or ""
 
-    ai_answer = get_openrouter_answer(text)
-    google = web_search(text + " latest")
+    loop = asyncio.get_event_loop()
 
-    if google:
-        ai_answer += "\n\n" + google
+    # Run blocking tasks async-safe
+    grok_answer = await loop.run_in_executor(None, get_grok_answer, user_msg)
+    search_result = await loop.run_in_executor(
+        None, web_search, user_msg + " latest news"
+    )
 
-    await update.message.reply_text(ai_answer)
+    final_reply = grok_answer or "उत्तर प्राप्त नहीं हुआ।"
 
+    if search_result:
+        final_reply += "\n\n" + search_result
 
-application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-
-# ----------------------
-# WEBHOOK ROUTE
-# ----------------------
-@app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
-def webhook():
-    try:
-        update = Update.de_json(request.get_json(force=True), bot)
-        application.process_update(update)
-    except Exception as e:
-        print("Webhook error:", e)
-    return "OK", 200
+    await update.message.reply_text(final_reply)
 
 
-# ----------------------
-# HOME ROUTE
-# ----------------------
-@app.route("/", methods=["GET"])
-def home():
-    return {
-        "status": "PastGlobeBot Running",
-        "time": datetime.now(timezone.utc).isoformat()
-    }
+def run_bot():
+    global application
+
+    if not TELEGRAM_TOKEN:
+        print("ERROR: TELEGRAM_TOKEN missing!")
+        return
+
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
+
+    print("Telegram Bot Polling शुरू...")
+    application.run_polling()
 
 
-# ----------------------
-# SET WEBHOOK SAFE
-# ----------------------
-def set_webhook_async():
-    try:
-        webhook_url = f"https://pastglobebot.onrender.com/webhook/{TELEGRAM_TOKEN}"
-        bot.delete_webhook()
-        bot.set_webhook(url=webhook_url)
-        print("Webhook set:", webhook_url)
-    except Exception as e:
-        print("Webhook setup failed:", e)
-
-
-# THREAD TO AUTO-SET WEBHOOK
-threading.Thread(target=set_webhook_async).start()
-
-
-# ----------------------
-# RUN SERVER
-# ----------------------
+# -------------------------
+#       ENTRY POINT
+# -------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+
+    # Start Telegram polling bot in background thread
+    threading.Thread(target=run_bot, daemon=True).start()
+
+    # Start Flask (Render provides $PORT)
+    port = int(os.getenv("PORT", "10000"))
+    print(f"Flask LIVE on port {port}")
+
+    app.run(host="0.0.0.0", port=port)

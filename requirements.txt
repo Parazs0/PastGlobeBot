@@ -1,7 +1,6 @@
+python-telegram-bot==20.8
 flask
-python-telegram-bot==20.7
+gunicorn
 requests
-bs4
 googlesearch-python
 python-dotenv
-gunicorn
