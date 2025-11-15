@@ -1,150 +1,105 @@
-# main.py
 import os
-import threading
-import asyncio
-from datetime import datetime, timezone
-from flask import Flask, jsonify
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import requests
+from flask import Flask, request
+from telegram import Bot, Update
+from telegram.ext import Dispatcher, CommandHandler, MessageHandler, filters
 from googlesearch import search
 from dotenv import load_dotenv
+import requests
+from datetime import datetime, timezone
 
-# Load env (Render पर भी ठीक)
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 
+bot = Bot(token=TELEGRAM_TOKEN)
 app = Flask(__name__)
 
-# -------------------------
-#        FLASK ROUTES
-# -------------------------
-@app.route("/")
-def home():
-    return jsonify({
-        "status": "PastGlobeBot",
-        "time": datetime.now(timezone.utc).isoformat()
-    })
-
-@app.route("/health")
-def health():
-    return "OK"
+# Dispatcher
+dispatcher = Dispatcher(bot=bot, update_queue=None, workers=4)
 
 
-# -------------------------
-#      GROK ANSWER API
-# -------------------------
+# ========= GROK ANSWER =========
 def get_grok_answer(question):
-    """Blocking: runs inside async executor"""
-    
-    # 📌 Auto-detected today's date for daily updated info
-    today = datetime.now().strftime("%d %B %Y")
-
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENROUTER_KEY}",
-        "Referer": "https://t.me/PastGlobeBot",
+        "HTTP-Referer": "https://t.me/PastGlobeBot",
         "X-Title": "PastGlobeBot",
         "Content-Type": "application/json"
     }
-
     data = {
         "model": "x-ai/grok-beta",
         "messages": [
-            {
-                "role": "user",
-                "content": (
-                    f"{question} "
-                    f"(संक्षिप्त हिंदी में, {today} तक की ताज़ा जानकारी)"
-                )
-            }
+            {"role": "user", "content": question + " (संक्षिप्त हिंदी में, Daily updated info)"}
         ]
     }
 
     try:
-        r = requests.post(url, json=data, headers=headers, timeout=60)
+        r = requests.post(url, json=data, headers=headers, timeout=30)
         if r.status_code != 200:
             return f"API Error {r.status_code}"
-
-        j = r.json()
-        return j.get("choices", [{}])[0].get("message", {}).get("content", "No content")
-
+        return r.json()['choices'][0]['message']['content']
     except Exception as e:
         return f"Error: {str(e)}"
 
 
-# -------------------------
-#         WEB SEARCH
-# -------------------------
+# ========= WEB SEARCH =========
 def web_search(query):
-    """Blocking: runs inside async executor"""
     try:
-        results = list(search(query, num_results=2, lang="hi"))
-        if results:
-            return "लेटेस्ट वेब रिज़ल्ट्स:\n" + "\n".join(f"• {r}" for r in results)
-        return ""
+        results = list(search(query, num_results=2))
+        return "🔍 लेटेस्ट जानकारी:\n" + "\n".join([f"• {r}" for r in results])
     except:
         return ""
 
 
-# -------------------------
-#       TELEGRAM BOT
-# -------------------------
-application = None
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("नमस्ते! मैं आपको ताज़ा अपडेट के साथ मदद करूँगा।")
+# ========= COMMAND HANDLERS =========
+def start(update, context):
+    update.message.reply_text("नमस्ते! मैं PastGlobeBot हूँ — पूछिए कुछ भी!")
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_msg = update.message.text or ""
+def handle_message(update, context):
+    user_msg = update.message.text
 
-    loop = asyncio.get_event_loop()
+    answer = get_grok_answer(user_msg)
+    search_results = web_search(user_msg + " latest news")
 
-    # Run blocking tasks async-safe
-    grok_answer = await loop.run_in_executor(None, get_grok_answer, user_msg)
-    search_result = await loop.run_in_executor(
-        None, web_search, user_msg + " latest news"
-    )
+    if search_results:
+        answer += "\n\n" + search_results
 
-    final_reply = grok_answer or "उत्तर प्राप्त नहीं हुआ।"
-
-    if search_result:
-        final_reply += "\n\n" + search_result
-
-    await update.message.reply_text(final_reply)
+    update.message.reply_text(answer)
 
 
-def run_bot():
-    global application
-
-    if not TELEGRAM_TOKEN:
-        print("ERROR: TELEGRAM_TOKEN missing!")
-        return
-
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    )
-
-    print("Telegram Bot Polling शुरू...")
-    application.run_polling()
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 
-# -------------------------
-#       ENTRY POINT
-# -------------------------
+# ========= FLASK ROUTES =========
+
+@app.route("/", methods=["GET"])
+def home():
+    return {
+        "status": "PastGlobeBot",
+        "time": datetime.now(timezone.utc).isoformat()
+    }
+
+
+# ======= CORRECT WEBHOOK ROUTE =======
+@app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), bot)
+    dispatcher.process_update(update)
+    return "OK", 200
+
+
+# ========= SET WEBHOOK =========
+@app.before_first_request
+def set_webhook():
+    webhook_url = f"https://pastglobebot.onrender.com/webhook/{TELEGRAM_TOKEN}"
+    bot.delete_webhook()
+    bot.set_webhook(url=webhook_url)
+
+
+# ========= RUN =========
 if __name__ == "__main__":
-
-    # Start Telegram polling bot in background thread
-    threading.Thread(target=run_bot, daemon=True).start()
-
-    # Start Flask (Render provides $PORT)
-    port = int(os.getenv("PORT", "10000"))
-    print(f"Flask LIVE on port {port}")
-
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
